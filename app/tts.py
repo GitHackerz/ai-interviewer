@@ -1,5 +1,5 @@
 """
-Text-to-Speech module using pyttsx3
+Text-to-Speech module using gTTS and pydub
 Converts AI text responses to speech audio
 """
 import os
@@ -7,8 +7,8 @@ import asyncio
 import tempfile
 from typing import Optional
 import numpy as np
-import pyttsx3
-import wave
+from gtts import gTTS
+from pydub import AudioSegment
 import logging
 
 logger = logging.getLogger(__name__)
@@ -24,23 +24,17 @@ class TTSHandler:
         Initialize TTS Handler
         
         Args:
-            rate: Speech rate (words per minute)
-            volume: Volume level (0.0 to 1.0)
+            rate: Speech rate (words per minute) - not used with gTTS
+            volume: Volume level (0.0 to 1.0) - not used with gTTS
         """
         self.rate = rate
         self.volume = volume
-        self.engine: Optional[pyttsx3.Engine] = None
+        self.initialized = False
         
     async def initialize(self):
-        """Load the TTS engine asynchronously"""
-        loop = asyncio.get_event_loop()
-        self.engine = await loop.run_in_executor(
-            None,
-            lambda: pyttsx3.init()
-        )
-        self.engine.setProperty('rate', self.rate)
-        self.engine.setProperty('volume', self.volume)
-        logger.info(f"TTS engine initialized (rate={self.rate}, volume={self.volume})")
+        """Initialize TTS handler"""
+        self.initialized = True
+        logger.info(f"TTS handler initialized")
         
     async def synthesize(self, text: str) -> tuple[np.ndarray, int]:
         """
@@ -52,34 +46,42 @@ class TTSHandler:
         Returns:
             Tuple of (audio as numpy array, sample rate)
         """
-        if self.engine is None:
+        if not self.initialized:
             await self.initialize()
             
         try:
             # Run TTS in thread pool to avoid blocking
             loop = asyncio.get_event_loop()
             
-            # Create temporary file for audio output
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-                tmp_path = tmp_file.name
+            # Create temporary files
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+                tmp_mp3_path = tmp_mp3.name
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+                tmp_wav_path = tmp_wav.name
             
             # Generate speech
             await loop.run_in_executor(
                 None,
-                lambda: self.engine.save_to_file(text, tmp_path)
+                lambda: gTTS(text=text, lang='en', slow=False).save(tmp_mp3_path)
             )
-            await loop.run_in_executor(None, self.engine.runAndWait)
+            
+            # Convert MP3 to WAV
+            await loop.run_in_executor(
+                None,
+                lambda: AudioSegment.from_mp3(tmp_mp3_path).export(tmp_wav_path, format="wav")
+            )
             
             # Load the audio file
-            with wave.open(tmp_path, 'rb') as wav_file:
-                sample_rate = wav_file.getframerate()
-                frames = wav_file.readframes(wav_file.getnframes())
-                audio_data = np.frombuffer(frames, dtype=np.int16)
-                
-            # Clean up temp file
-            os.unlink(tmp_path)
+            audio_segment = AudioSegment.from_wav(tmp_wav_path)
+            sample_rate = audio_segment.frame_rate
+            audio_data = np.array(audio_segment.get_array_of_samples(), dtype=np.int16)
             
-            logger.info(f"Synthesized speech for text: {text[:50]}...")
+            # Clean up temp files
+            os.unlink(tmp_mp3_path)
+            os.unlink(tmp_wav_path)
+            
+            logger.info(f"Synthesized speech for text: {text[:50]}... "
+                       f"(audio length: {len(audio_data)} samples, rate: {sample_rate} Hz)")
             return audio_data, sample_rate
             
         except Exception as e:
@@ -115,16 +117,29 @@ class TTSHandler:
             text: Text to synthesize
             output_path: Path to save WAV file
         """
-        if self.engine is None:
+        if not self.initialized:
             await self.initialize()
             
         try:
             loop = asyncio.get_event_loop()
+            # Create temporary MP3 file
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+                tmp_mp3_path = tmp_mp3.name
+            
+            # Generate speech
             await loop.run_in_executor(
                 None,
-                lambda: self.engine.save_to_file(text, output_path)
+                lambda: gTTS(text=text, lang='en', slow=False).save(tmp_mp3_path)
             )
-            await loop.run_in_executor(None, self.engine.runAndWait)
+            
+            # Convert to WAV
+            await loop.run_in_executor(
+                None,
+                lambda: AudioSegment.from_mp3(tmp_mp3_path).export(output_path, format="wav")
+            )
+            
+            # Clean up
+            os.unlink(tmp_mp3_path)
             logger.info(f"Saved speech to {output_path}")
             
         except Exception as e:

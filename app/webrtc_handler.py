@@ -50,19 +50,57 @@ class AudioProcessor(MediaStreamTrack):
         self.silence_threshold = 2.0  # seconds of silence before processing
         self.silence_duration = 0.0
         
+        # Voice statistics
+        self.voice_stats = {
+            "volume_avg": 0.0,
+            "volume_max": 0.0,
+            "clarity_score": 0.0,
+            "speaking_duration": 0.0,
+            "num_utterances": 0
+        }
+        self.energy_samples = []
+        self.greeting_sent = False
+        self.frame_count = 0
+        
     async def recv(self):
         """Receive and process audio frames"""
+        # Check if we have a response to send first
+        if not self.response_queue.empty():
+            response_frame = await self.response_queue.get()
+            logger.info("Sending queued audio response frame")
+            return response_frame
+        
         frame = await self.track.recv()
+        
+        # Send greeting after connection is stable (after ~50 frames / 1 second)
+        self.frame_count += 1
+        if not self.greeting_sent and self.frame_count > 50:
+            self.greeting_sent = True
+            logger.info("Sending greeting after connection stable")
+            asyncio.create_task(self._send_greeting())
         
         # Convert frame to numpy array
         audio_data = frame.to_ndarray()
+        
+        # Log first few frames to verify audio reception
+        if self.frame_count < 5:
+            logger.info(f"Frame {self.frame_count}: shape={audio_data.shape}, dtype={audio_data.dtype}, sample_rate={frame.sample_rate}")
         
         # Accumulate audio buffer
         self.audio_buffer.append(audio_data)
         self.buffer_duration += frame.samples / frame.sample_rate
         
-        # Detect silence (simple energy-based)
+        # Calculate audio energy for statistics
         energy = np.sqrt(np.mean(audio_data.astype(float) ** 2))
+        
+        # Log energy periodically
+        if self.frame_count % 100 == 0:
+            logger.info(f"Audio energy at frame {self.frame_count}: {energy:.4f}")
+        
+        # Track voice statistics
+        if energy > 0.01:  # Voice detected
+            self.energy_samples.append(energy)
+            self.voice_stats["speaking_duration"] += frame.samples / frame.sample_rate
         
         if energy < 0.01:  # Silence threshold
             self.silence_duration += frame.samples / frame.sample_rate
@@ -73,15 +111,18 @@ class AudioProcessor(MediaStreamTrack):
         if (self.silence_duration >= self.silence_threshold and 
             self.buffer_duration >= 1.0 and 
             not self.processing):
+            logger.info(f"Triggering audio processing: buffer_duration={self.buffer_duration:.2f}s, silence={self.silence_duration:.2f}s")
             asyncio.create_task(self._process_audio_buffer())
         
-        # Check if we have a response to send
-        if not self.response_queue.empty():
-            response_frame = await self.response_queue.get()
-            return response_frame
-        
-        # Return the original frame (pass-through)
-        return frame
+        # Return silence frame (don't echo user's voice back)
+        silence = np.zeros_like(audio_data, dtype=audio_data.dtype)
+        silent_frame = AudioFrame.from_ndarray(
+            silence,
+            format=frame.format.name,
+            layout=frame.layout.name
+        )
+        silent_frame.sample_rate = frame.sample_rate
+        return silent_frame
     
     async def _process_audio_buffer(self):
         """Process accumulated audio buffer through STT -> LLM -> TTS"""
@@ -114,6 +155,10 @@ class AudioProcessor(MediaStreamTrack):
             
             logger.info(f"User said: {transcription}")
             
+            # Update voice statistics
+            self._update_voice_stats()
+            self.voice_stats["num_utterances"] += 1
+            
             # Step 2: Get AI response (LLM)
             ai_response = await self.llm.get_response(transcription)
             logger.info(f"AI response: {ai_response}")
@@ -134,21 +179,68 @@ class AudioProcessor(MediaStreamTrack):
             self.silence_duration = 0.0
             self.processing = False
     
+    def _update_voice_stats(self):
+        """Update voice statistics from collected energy samples"""
+        if self.energy_samples:
+            self.voice_stats["volume_avg"] = float(np.mean(self.energy_samples))
+            self.voice_stats["volume_max"] = float(np.max(self.energy_samples))
+            
+            # Calculate clarity score based on signal consistency
+            if len(self.energy_samples) > 1:
+                std_dev = np.std(self.energy_samples)
+                mean = np.mean(self.energy_samples)
+                # Normalize clarity: lower variation relative to mean = higher clarity
+                self.voice_stats["clarity_score"] = min(100, max(0, 100 * (1 - std_dev / (mean + 0.001))))
+            
+            # Log statistics
+            logger.info(f"Voice Stats - Volume: {self.voice_stats['volume_avg']:.4f}, "
+                       f"Max: {self.voice_stats['volume_max']:.4f}, "
+                       f"Clarity: {self.voice_stats['clarity_score']:.1f}%, "
+                       f"Speaking Time: {self.voice_stats['speaking_duration']:.1f}s")
+    
+    async def _send_greeting(self):
+        """Send initial greeting to user"""
+        try:
+            greeting_text = "Hello! Welcome to your AI interview. Please introduce yourself and tell me about your background."
+            logger.info(f"Synthesizing greeting: {greeting_text}")
+            
+            # Synthesize greeting
+            greeting_audio, greeting_sr = await self.tts.synthesize(greeting_text)
+            logger.info(f"Greeting audio generated: {len(greeting_audio)} samples at {greeting_sr}Hz")
+            
+            if len(greeting_audio) == 0:
+                logger.error("TTS returned empty audio!")
+                return
+            
+            # Queue greeting audio
+            await self._queue_audio_response(greeting_audio, greeting_sr)
+            logger.info(f"Greeting audio queued: {self.response_queue.qsize()} frames in queue")
+            
+        except Exception as e:
+            logger.error(f"Greeting error: {e}", exc_info=True)
+    
     async def _queue_audio_response(self, audio_data: np.ndarray, sample_rate: int):
         """Queue audio response frames for transmission"""
         try:
-            # Convert int16 to float32 and normalize
-            audio_float = audio_data.astype(np.float32) / 32768.0
+            if len(audio_data) == 0:
+                logger.warning("Received empty audio data, skipping")
+                return
+            
+            logger.info(f"Queueing audio response: {len(audio_data)} samples at {sample_rate} Hz")
+            
+            # Audio data is already int16 from TTS
+            audio_int16 = audio_data
             
             # Create chunks (20ms per frame)
             samples_per_frame = int(sample_rate * 0.02)
+            frame_count = 0
             
-            for i in range(0, len(audio_float), samples_per_frame):
-                chunk = audio_float[i:i + samples_per_frame]
+            for i in range(0, len(audio_int16), samples_per_frame):
+                chunk = audio_int16[i:i + samples_per_frame]
                 
                 # Pad last chunk if needed
                 if len(chunk) < samples_per_frame:
-                    chunk = np.pad(chunk, (0, samples_per_frame - len(chunk)))
+                    chunk = np.pad(chunk, (0, samples_per_frame - len(chunk)), constant_values=0)
                 
                 # Reshape to (channels, samples) - mono audio
                 chunk = chunk.reshape(1, -1)
@@ -156,7 +248,7 @@ class AudioProcessor(MediaStreamTrack):
                 # Create audio frame
                 frame = AudioFrame.from_ndarray(
                     chunk,
-                    format='flt',
+                    format='s16',
                     layout='mono'
                 )
                 frame.sample_rate = sample_rate
@@ -164,6 +256,9 @@ class AudioProcessor(MediaStreamTrack):
                 
                 # Queue frame
                 await self.response_queue.put(frame)
+                frame_count += 1
+            
+            logger.info(f"Queued {frame_count} audio frames for playback")
                 
         except Exception as e:
             logger.error(f"Error queuing audio response: {e}", exc_info=True)
@@ -188,6 +283,7 @@ class WebRTCHandler:
     
     def __init__(self):
         self.peers: Dict[str, RTCPeerConnection] = {}
+        self.audio_processors: Dict[str, AudioProcessor] = {}
         self.relay = MediaRelay()
         
     def create_peer_connection(self) -> tuple[str, RTCPeerConnection]:
@@ -211,6 +307,7 @@ class WebRTCHandler:
             if track.kind == "audio":
                 # Process audio through STT -> LLM -> TTS pipeline
                 processor = AudioProcessor(track)
+                self.audio_processors[peer_id] = processor
                 pc.addTrack(processor)
                 
             elif track.kind == "video":
@@ -226,12 +323,20 @@ class WebRTCHandler:
         
         return peer_id, pc
     
+    def get_voice_stats(self, peer_id: str) -> dict:
+        """Get voice statistics for a peer"""
+        if peer_id in self.audio_processors:
+            return self.audio_processors[peer_id].voice_stats.copy()
+        return {}
+    
     async def close_peer_connection(self, peer_id: str):
         """Close and remove a peer connection"""
         if peer_id in self.peers:
             pc = self.peers[peer_id]
             await pc.close()
             del self.peers[peer_id]
+            if peer_id in self.audio_processors:
+                del self.audio_processors[peer_id]
             logger.info(f"Closed peer connection: {peer_id}")
     
     async def cleanup(self):

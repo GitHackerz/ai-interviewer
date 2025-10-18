@@ -114,6 +114,27 @@ async def health_check():
     }
 
 
+@app.get("/test-audio")
+async def test_audio():
+    """Test audio generation"""
+    try:
+        from app.tts import get_tts_handler
+        tts = get_tts_handler()
+        audio_data, sample_rate = await tts.synthesize("Hello, this is a test.")
+        return {
+            "status": "success",
+            "audio_samples": len(audio_data),
+            "sample_rate": sample_rate,
+            "duration_seconds": len(audio_data) / sample_rate
+        }
+    except Exception as e:
+        logger.error(f"Test audio error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
 @app.post("/offer", response_model=AnswerResponse)
 async def offer(request: OfferRequest):
     """
@@ -147,6 +168,29 @@ async def offer(request: OfferRequest):
         
     except Exception as e:
         logger.error(f"Error handling offer: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/stats/{peer_id}")
+async def get_voice_stats(peer_id: str):
+    """Get voice statistics for a peer"""
+    try:
+        webrtc = get_webrtc_handler()
+        stats = webrtc.get_voice_stats(peer_id)
+        if stats:
+            return {
+                "status": "success",
+                "stats": stats
+            }
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Peer not found or no statistics available"}
+        )
+    except Exception as e:
+        logger.error(f"Error getting voice stats: {e}")
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
